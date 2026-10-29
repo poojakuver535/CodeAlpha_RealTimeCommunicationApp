@@ -1,0 +1,242 @@
+<%- include('partials/nav') %>
+<link rel="stylesheet" href="/style.css">
+<main class="room-container">
+  <div class="room-main">
+    <div class="room-header">
+      <h2>Room: <%= roomId %></h2>
+      <button class="btn-small" onclick="navigator.clipboard.writeText(window.location.href); alert('Link copied!')">Copy Invite Link</button>
+    </div>
+
+    <div id="videos" class="videos"></div>
+
+    <div class="controls">
+      <button id="toggleMic" class="btn">🎤 Mic</button>
+      <button id="toggleCam" class="btn">📷 Cam</button>
+      <button id="shareScreen" class="btn">🖥️ Share Screen</button>
+      <button id="toggleWhiteboard" class="btn">✏️ Whiteboard</button>
+      <input type="file" id="fileInput" style="display:none">
+      <button class="btn" onclick="document.getElementById('fileInput').click()">📎 Share File</button>
+      <a href="/" class="btn danger">Leave</a>
+    </div>
+
+    <canvas id="whiteboard" width="800" height="400" style="display:none; background:#fff; border:1px solid #ccc;"></canvas>
+    <button id="clearBoard" class="btn-small" style="display:none">Clear Board</button>
+  </div>
+
+  <aside class="sidebar">
+    <h3>Chat</h3>
+    <div id="chat" class="chat"></div>
+    <form id="chatForm" class="chat-form">
+      <input id="chatInput" placeholder="Type a message..." autocomplete="off">
+      <button class="btn-small">Send</button>
+    </form>
+    <h3>Shared Files</h3>
+    <div id="files" class="files"></div>
+  </aside>
+</main>
+
+<script src="/socket.io/socket.io.js"></script>
+<script>
+const ROOM = "<%= roomId %>";
+const USERNAME = "<%= user.username %>";
+const socket = io();
+const peers = {};  // socketId -> RTCPeerConnection
+let localStream;
+let screenStream;
+
+const iceServers = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+
+async function start() {
+  try {
+    localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+    addVideo('local', localStream, USERNAME + ' (You)', true);
+    socket.emit('join-room', ROOM);
+  } catch (e) {
+    alert('Could not access camera/microphone: ' + e.message);
+  }
+}
+
+function addVideo(id, stream, label, muted=false) {
+  if (document.getElementById('v-' + id)) return;
+  const wrap = document.createElement('div');
+  wrap.className = 'video-wrap';
+  wrap.id = 'v-' + id;
+  const v = document.createElement('video');
+  v.srcObject = stream;
+  v.autoplay = true;
+  v.playsInline = true;
+  v.muted = muted;
+  const lbl = document.createElement('div');
+  lbl.className = 'label';
+  lbl.textContent = label;
+  wrap.appendChild(v);
+  wrap.appendChild(lbl);
+  document.getElementById('videos').appendChild(wrap);
+}
+
+function removeVideo(id) {
+  const el = document.getElementById('v-' + id);
+  if (el) el.remove();
+}
+
+function createPeer(targetId, username, initiator) {
+  const pc = new RTCPeerConnection(iceServers);
+  peers[targetId] = pc;
+
+  localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
+
+  pc.onicecandidate = (e) => {
+    if (e.candidate) socket.emit('ice-candidate', { target: targetId, candidate: e.candidate });
+  };
+
+  pc.ontrack = (e) => addVideo(targetId, e.streams[0], username);
+
+  if (initiator) {
+    pc.createOffer().then(offer => {
+      pc.setLocalDescription(offer);
+      socket.emit('offer', { target: targetId, sdp: offer });
+    });
+  }
+  return pc;
+}
+
+socket.on('existing-users', (users) => {
+  users.forEach(u => createPeer(u.socketId, u.username, true));
+});
+socket.on('user-joined', ({ socketId, username }) => {
+  // Wait for their offer
+  addChatSystem(username + ' joined.');
+});
+socket.on('offer', async ({ from, username, sdp }) => {
+  const pc = createPeer(from, username, false);
+  await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+  const answer = await pc.createAnswer();
+  await pc.setLocalDescription(answer);
+  socket.emit('answer', { target: from, sdp: answer });
+});
+socket.on('answer', async ({ from, sdp }) => {
+  await peers[from]?.setRemoteDescription(new RTCSessionDescription(sdp));
+});
+socket.on('ice-candidate', async ({ from, candidate }) => {
+  try { await peers[from]?.addIceCandidate(new RTCIceCandidate(candidate)); } catch (e) {}
+});
+socket.on('user-left', ({ socketId, username }) => {
+  if (peers[socketId]) { peers[socketId].close(); delete peers[socketId]; }
+  removeVideo(socketId);
+  addChatSystem(username + ' left.');
+});
+
+// Controls
+document.getElementById('toggleMic').onclick = () => {
+  localStream.getAudioTracks().forEach(t => t.enabled = !t.enabled);
+};
+document.getElementById('toggleCam').onclick = () => {
+  localStream.getVideoTracks().forEach(t => t.enabled = !t.enabled);
+};
+document.getElementById('shareScreen').onclick = async () => {
+  try {
+    screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true });
+    const screenTrack = screenStream.getVideoTracks()[0];
+    Object.values(peers).forEach(pc => {
+      const sender = pc.getSenders().find(s => s.track && s.track.kind === 'video');
+      if (sender) sender.replaceTrack(screenTrack);
+    });
+    screenTrack.onended = () => {
+      const camTrack = localStream.getVideoTracks()[0];
+      Object.values(peers).forEach(pc => {
+        const sender = pc.getSenders().find(s => s.track && s.track.kind === 'video');
+        if (sender) sender.replaceTrack(camTrack);
+      });
+    };
+  } catch (e) { console.log('Screen share cancelled.'); }
+};
+
+// Chat
+const chatEl = document.getElementById('chat');
+document.getElementById('chatForm').onsubmit = (e) => {
+  e.preventDefault();
+  const input = document.getElementById('chatInput');
+  if (input.value.trim()) {
+    socket.emit('chat-message', input.value);
+    input.value = '';
+  }
+};
+socket.on('chat-message', (msg) => {
+  const div = document.createElement('div');
+  div.className = 'chat-msg';
+  div.innerHTML = '<strong>' + msg.username + '</strong> <small>' + msg.time + '</small><br>' + escapeHtml(msg.text);
+  chatEl.appendChild(div);
+  chatEl.scrollTop = chatEl.scrollHeight;
+});
+function addChatSystem(text) {
+  const div = document.createElement('div');
+  div.className = 'chat-system';
+  div.textContent = text;
+  chatEl.appendChild(div);
+}
+function escapeHtml(s) { return s.replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
+// Whiteboard
+const canvas = document.getElementById('whiteboard');
+const ctx = canvas.getContext('2d');
+let drawing = false;
+let lastPos = null;
+
+document.getElementById('toggleWhiteboard').onclick = () => {
+  canvas.style.display = canvas.style.display === 'none' ? 'block' : 'none';
+  document.getElementById('clearBoard').style.display = canvas.style.display;
+};
+document.getElementById('clearBoard').onclick = () => {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  socket.emit('clear-board');
+};
+
+canvas.addEventListener('mousedown', (e) => { drawing = true; lastPos = getPos(e); });
+canvas.addEventListener('mouseup', () => { drawing = false; lastPos = null; });
+canvas.addEventListener('mousemove', (e) => {
+  if (!drawing) return;
+  const pos = getPos(e);
+  drawLine(lastPos, pos);
+  socket.emit('draw', { from: lastPos, to: pos });
+  lastPos = pos;
+});
+function getPos(e) {
+  const r = canvas.getBoundingClientRect();
+  return { x: e.clientX - r.left, y: e.clientY - r.top };
+}
+function drawLine(a, b) {
+  ctx.beginPath();
+  ctx.moveTo(a.x, a.y);
+  ctx.lineTo(b.x, b.y);
+  ctx.strokeStyle = '#000';
+  ctx.lineWidth = 2;
+  ctx.stroke();
+}
+socket.on('draw', ({ from, to }) => drawLine(from, to));
+socket.on('clear-board', () => ctx.clearRect(0, 0, canvas.width, canvas.height));
+
+// File sharing
+document.getElementById('fileInput').onchange = (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  if (file.size > 50 * 1024 * 1024) { alert('File too large (max 50MB)'); return; }
+  const reader = new FileReader();
+  reader.onload = () => {
+    socket.emit('share-file', { name: file.name, type: file.type, data: reader.result });
+  };
+  reader.readAsDataURL(file);
+};
+socket.on('file-received', ({ username, name, data }) => {
+  const div = document.createElement('div');
+  div.className = 'file-item';
+  const a = document.createElement('a');
+  a.href = data;
+  a.download = name;
+  a.textContent = '📎 ' + name;
+  div.innerHTML = '<small>From ' + username + ':</small><br>';
+  div.appendChild(a);
+  document.getElementById('files').appendChild(div);
+});
+
+start();
+</script>

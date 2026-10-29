@@ -1,0 +1,23 @@
+<%- include('partials/nav') %>
+<link rel="stylesheet" href="/style.css">
+<main class="container home">
+  <h1>Start or Join a Meeting</h1>
+  <div class="actions">
+    <button class="btn" onclick="createRoom()">Create New Room</button>
+    <form onsubmit="joinRoom(event)">
+      <input id="roomInput" type="text" placeholder="Enter Room ID" required>
+      <button type="submit" class="btn">Join</button>
+    </form>
+  </div>
+  <script>
+    function createRoom() {
+      const id = Math.random().toString(36).substring(2, 10);
+      window.location.href = '/room/' + id;
+    }
+    function joinRoom(e) {
+      e.preventDefault();
+      const id = document.getElementById('roomInput').value.trim();
+      if (id) window.location.href = '/room/' + id;
+    }
+  </script>
+</main>
